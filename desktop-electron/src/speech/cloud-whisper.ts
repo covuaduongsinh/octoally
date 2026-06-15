@@ -39,6 +39,7 @@ export function transcribeCloud(
   apiKey: string,
   samples: Float32Array,
   promptHint?: string,
+  language = 'en',
 ): Promise<string> {
   const cfg = PROVIDERS[provider];
   if (!cfg) throw new Error(`Unknown provider: ${provider}`);
@@ -70,12 +71,15 @@ export function transcribeCloud(
       `${cfg.model}\r\n`,
     ));
 
-    // language field (speeds up processing)
-    parts.push(Buffer.from(
-      `--${boundary}\r\n` +
-      `Content-Disposition: form-data; name="language"\r\n\r\n` +
-      `en\r\n`,
-    ));
+    // language field (speeds up processing). Omit for 'auto' so the API
+    // auto-detects the spoken language.
+    if (language && language !== 'auto') {
+      parts.push(Buffer.from(
+        `--${boundary}\r\n` +
+        `Content-Disposition: form-data; name="language"\r\n\r\n` +
+        `${language}\r\n`,
+      ));
+    }
 
     // prompt field (biases Whisper toward expected vocabulary)
     if (promptHint) {

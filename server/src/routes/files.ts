@@ -1,6 +1,7 @@
 import { FastifyPluginAsync } from 'fastify';
-import { readdir, stat, readFile, writeFile, rm, rename, cp } from 'fs/promises';
+import { readdir, stat, readFile, writeFile, rm, rename, cp, mkdir } from 'fs/promises';
 import { join, resolve, extname, dirname, basename } from 'path';
+import { homedir } from 'os';
 import { exec } from 'child_process';
 
 interface FileEntry {
@@ -58,6 +59,31 @@ export const fileRoutes: FastifyPluginAsync = async (app) => {
       return reply.status(500).send({ error: 'Failed to read directory' });
     }
   });
+
+  // Save a pasted clipboard image to a temp file and return its absolute path.
+  // The terminal calls this when an image is pasted, then inserts the path into
+  // the prompt so Claude Code can read the image from disk.
+  app.post<{ Body: { dataUrl?: string } }>(
+    '/paste-image',
+    { bodyLimit: 30 * 1024 * 1024 },
+    async (req, reply) => {
+      const dataUrl = req.body?.dataUrl;
+      if (!dataUrl || typeof dataUrl !== 'string') {
+        return reply.status(400).send({ error: 'dataUrl is required' });
+      }
+      const m = /^data:image\/(png|jpe?g|gif|webp|bmp);base64,(.+)$/i.exec(dataUrl);
+      if (!m) return reply.status(400).send({ error: 'invalid image data URL' });
+      let ext = m[1].toLowerCase();
+      if (ext === 'jpeg') ext = 'jpg';
+      const buf = Buffer.from(m[2], 'base64');
+      const dir = join(homedir(), '.octoally', 'pasted');
+      await mkdir(dir, { recursive: true });
+      const ts = new Date().toISOString().replace(/[:.]/g, '-');
+      const filePath = join(dir, `paste-${ts}.${ext}`);
+      await writeFile(filePath, buf);
+      return { ok: true, path: filePath };
+    },
+  );
 
   // Read file contents (for the file viewer)
   app.get<{

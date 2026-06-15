@@ -1,7 +1,13 @@
 import { useEffect, useRef, useState } from 'react';
-import { Settings, Download, Check, Loader2, X, Cloud, HardDrive, Eye, EyeOff, Ear, Plus, Trash2, Sparkles, Timer, Clock } from 'lucide-react';
+import { Settings, Download, Check, Loader2, X, Cloud, HardDrive, Eye, EyeOff, Ear, Plus, Trash2, Sparkles, Timer, Clock, Languages } from 'lucide-react';
 import { invoke } from '../lib/tauri';
-import { useSpeechStore, downloadModel, stopMic, unloadModel, setWakePhrase, setSilenceTimeout, setMaxSpeechDuration } from '../lib/speech';
+import { useSpeechStore, downloadModel, stopMic, unloadModel, setWakePhrase, setSilenceTimeout, setMaxSpeechDuration, setLanguage } from '../lib/speech';
+
+const LANGUAGE_OPTIONS: { value: string; label: string }[] = [
+  { value: 'auto', label: 'Auto-detect' },
+  { value: 'en', label: 'English' },
+  { value: 'vi', label: 'Tiếng Việt' },
+];
 
 interface ModelInfo {
   installed: boolean;
@@ -53,6 +59,7 @@ export function ModelSettingsModal({ onClose }: ModelSettingsModalProps) {
   const committedWakePhrase = useRef(useSpeechStore.getState().wakePhrase);
   const committedSilenceTimeout = useRef(useSpeechStore.getState().silenceTimeoutMs);
   const committedMaxSpeech = useRef(useSpeechStore.getState().maxSpeechMs);
+  const committedLanguage = useRef(useSpeechStore.getState().language);
 
   // Draft state — what the user is configuring (not yet saved)
   const [draftBackend, setDraftBackend] = useState<'local' | 'openai' | 'groq'>(committedBackend.current);
@@ -61,6 +68,7 @@ export function ModelSettingsModal({ onClose }: ModelSettingsModalProps) {
   const [draftWakePhrase, setDraftWakePhrase] = useState(committedWakePhrase.current);
   const [draftSilenceTimeout, setDraftSilenceTimeout] = useState(committedSilenceTimeout.current);
   const [draftMaxSpeech, setDraftMaxSpeech] = useState(committedMaxSpeech.current);
+  const [draftLanguage, setDraftLanguage] = useState(committedLanguage.current);
   const [showApiKey, setShowApiKey] = useState(false);
   const [activeTab, setActiveTab] = useState<'speech' | 'commands'>('speech');
 
@@ -70,7 +78,8 @@ export function ModelSettingsModal({ onClose }: ModelSettingsModalProps) {
     || (draftBackend === 'groq' && draftGroqKey !== committedGroqKey.current)
     || draftWakePhrase !== committedWakePhrase.current
     || draftSilenceTimeout !== committedSilenceTimeout.current
-    || draftMaxSpeech !== committedMaxSpeech.current;
+    || draftMaxSpeech !== committedMaxSpeech.current
+    || draftLanguage !== committedLanguage.current;
 
   const loadModels = async () => {
     setLoading(true);
@@ -167,6 +176,11 @@ export function ModelSettingsModal({ onClose }: ModelSettingsModalProps) {
         await setMaxSpeechDuration(draftMaxSpeech);
       }
 
+      // Save transcription language if changed
+      if (draftLanguage !== committedLanguage.current) {
+        await setLanguage(draftLanguage);
+      }
+
       // Update committed refs
       committedBackend.current = draftBackend;
       committedOpenaiKey.current = draftOpenaiKey;
@@ -174,6 +188,7 @@ export function ModelSettingsModal({ onClose }: ModelSettingsModalProps) {
       committedWakePhrase.current = draftWakePhrase;
       committedSilenceTimeout.current = draftSilenceTimeout;
       committedMaxSpeech.current = draftMaxSpeech;
+      committedLanguage.current = draftLanguage;
 
       onClose();
     } catch (e) {
@@ -190,6 +205,7 @@ export function ModelSettingsModal({ onClose }: ModelSettingsModalProps) {
     setDraftWakePhrase(committedWakePhrase.current);
     setDraftSilenceTimeout(committedSilenceTimeout.current);
     setDraftMaxSpeech(committedMaxSpeech.current);
+    setDraftLanguage(committedLanguage.current);
     onClose();
   };
 
@@ -380,6 +396,33 @@ export function ModelSettingsModal({ onClose }: ModelSettingsModalProps) {
               </div>
             </div>
           )}
+
+          {/* Transcription language */}
+          <div className="space-y-1.5">
+            <div className="flex items-center gap-1.5">
+              <Languages className="w-3 h-3" style={{ color: 'var(--text-secondary)' }} />
+              <label className="text-[10px] font-medium" style={{ color: 'var(--text-secondary)' }}>
+                Spoken Language
+              </label>
+            </div>
+            <select
+              value={draftLanguage}
+              onChange={(e) => setDraftLanguage(e.target.value)}
+              className="w-full px-2.5 py-1.5 rounded-md text-[11px] outline-none cursor-pointer"
+              style={{
+                background: 'var(--bg-tertiary)',
+                color: 'var(--text-primary)',
+                border: '1px solid var(--border)',
+              }}
+            >
+              {LANGUAGE_OPTIONS.map((o) => (
+                <option key={o.value} value={o.value}>{o.label}</option>
+              ))}
+            </select>
+            <p className="text-[10px] leading-relaxed" style={{ color: 'var(--text-secondary)' }}>
+              The language you speak when dictating. For Vietnamese, the <strong style={{ color: 'var(--text-primary)' }}>Groq</strong> backend gives the best accuracy.
+            </p>
+          </div>
 
           {/* Utterance timing (silence timeout) */}
           <div className="space-y-1.5">

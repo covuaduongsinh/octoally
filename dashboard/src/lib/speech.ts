@@ -3,6 +3,7 @@ import { isDesktop, invoke, listen } from './tauri';
 import { emitVoiceCommand } from './voice-commands';
 import type { VoiceCommandPayload } from './voice-commands';
 import { cueReady, cueSpeechEnd, cueTranscribed, cueWakeActivate } from './audio-cues';
+import { startMicCapture, stopMicCapture } from './mic-capture';
 
 // ---------------------------------------------------------------------------
 // Types (mirror Rust payloads)
@@ -56,6 +57,10 @@ interface SpeechStore {
   backend: 'local' | 'openai' | 'groq';
   openaiApiKey: string;
   groqApiKey: string;
+  language: string;
+  // True when the renderer captures the mic (Windows) instead of a native
+  // process in the main app. Drives whether we run Web Audio capture.
+  rendererCapture: boolean;
   smartMatching: boolean;
   speaking: boolean;
   transcribing: boolean; // true while whisper is processing audio
@@ -68,6 +73,10 @@ interface SpeechStore {
   // Global dictation button (top-bar Captions button) is active — inline
   // SessionMicButton should step aside so only one receives transcriptions.
   globalDictationActive: boolean;
+
+  // The session id of the terminal that currently has focus — dictation routes
+  // text only to this one, so grid/All view doesn't broadcast to every terminal.
+  focusedTerminalId: string | null;
 
   // Dictation mode (started via "start transcribe" voice command)
   dictationMode: boolean;
@@ -106,6 +115,7 @@ interface SpeechStore {
   setLastTranscription: (text: string) => void;
   setWakeWordPhase: (phase: 'passive' | 'active' | null) => void;
   setWakePhrase: (phrase: string) => void;
+  setFocusedTerminalId: (id: string | null) => void;
   setDictationMode: (v: boolean) => void;
   setGlobalDictationActive: (v: boolean) => void;
   setCommandModeActive: (v: boolean) => void;
@@ -119,6 +129,8 @@ interface SpeechStore {
   setBackend: (backend: 'local' | 'openai' | 'groq') => void;
   setOpenaiApiKey: (key: string) => void;
   setGroqApiKey: (key: string) => void;
+  setLanguage: (lang: string) => void;
+  setRendererCapture: (v: boolean) => void;
   triggerEnter: () => void;
   setError: (e: string | null) => void;
 }
@@ -133,12 +145,15 @@ export const useSpeechStore = create<SpeechStore>((set) => ({
   backend: 'local',
   openaiApiKey: '',
   groqApiKey: '',
+  language: 'en',
+  rendererCapture: false,
   smartMatching: true,
   speaking: false,
   transcribing: false,
   lastTranscription: '',
   wakeWordPhase: null,
   wakePhrase: 'hey octoally',
+  focusedTerminalId: null,
   dictationMode: false,
   globalDictationActive: false,
   commandModeActive: false,
@@ -163,6 +178,7 @@ export const useSpeechStore = create<SpeechStore>((set) => ({
   setLastTranscription: (text) => set({ lastTranscription: text }),
   setWakeWordPhase: (phase) => set({ wakeWordPhase: phase }),
   setWakePhrase: (phrase) => set({ wakePhrase: phrase }),
+  setFocusedTerminalId: (id) => set({ focusedTerminalId: id }),
   setDictationMode: (v) => set({ dictationMode: v }),
   setGlobalDictationActive: (v) => set({ globalDictationActive: v }),
   setCommandModeActive: (v) => set({ commandModeActive: v }),
@@ -178,6 +194,8 @@ export const useSpeechStore = create<SpeechStore>((set) => ({
   setBackend: (backend) => set({ backend }),
   setOpenaiApiKey: (key) => set({ openaiApiKey: key }),
   setGroqApiKey: (key) => set({ groqApiKey: key }),
+  setLanguage: (lang) => set({ language: lang }),
+  setRendererCapture: (v) => set({ rendererCapture: v }),
   triggerEnter: () => set((s) => ({ pendingEnter: s.pendingEnter + 1 })),
   setError: (e) => set({ error: e }),
 }));
@@ -211,7 +229,7 @@ export async function initSpeechListeners() {
 
   // Load saved config (backend, API key, wake phrase)
   try {
-    const config = await invoke<{ backend: string; openaiApiKey: string; groqApiKey: string; modelSize: string; wakePhrase?: string; smartMatching?: boolean; silenceTimeoutMs?: number; maxSpeechMs?: number }>('stt_get_config');
+    const config = await invoke<{ backend: string; openaiApiKey: string; groqApiKey: string; modelSize: string; language?: string; wakePhrase?: string; smartMatching?: boolean; silenceTimeoutMs?: number; maxSpeechMs?: number; rendererCapture?: boolean }>('stt_get_config');
     const store = useSpeechStore.getState();
     store.setBackend(config.backend as 'local' | 'openai' | 'groq');
     store.setOpenaiApiKey(config.openaiApiKey || '');
@@ -220,9 +238,17 @@ export async function initSpeechListeners() {
     if (config.silenceTimeoutMs) store.setSilenceTimeoutMs(config.silenceTimeoutMs);
     if (config.maxSpeechMs) store.setMaxSpeechMs(config.maxSpeechMs);
     if (config.wakePhrase) store.setWakePhrase(config.wakePhrase);
+    if (config.language) store.setLanguage(config.language);
+    store.setRendererCapture(config.rendererCapture === true);
   } catch (e) {
     console.warn('[STT] Failed to load config:', e);
   }
+
+  // On Windows the main process asks the renderer to stop its Web Audio mic
+  // when capture ends from the main side (voice command, command-mode timeout).
+  await listen<void>('stt://stop-capture', () => {
+    stopMicCapture();
+  });
 
   // Check initial model status
   try {
@@ -423,10 +449,12 @@ export async function startMic(mode: 'global' | 'push-to-talk') {
     store.setMicMode(mode);
 
     await invoke('stt_start', { mode });
+    if (store.rendererCapture) await startMicCapture();
     store.setModelLoaded(true);
     store.setError(null);
   } catch (e) {
     // Revert on failure
+    stopMicCapture();
     store.setMicMode('off');
     store.setMicReady(false);
     const msg = e instanceof Error ? e.message : String(e);
@@ -434,6 +462,8 @@ export async function startMic(mode: 'global' | 'push-to-talk') {
       // Whisper not installed — show download modal so user can install it
       store.setShowDownloadModal(true, mode);
       store.setError(null);
+    } else if (msg.includes('Permission') || msg.includes('NotAllowed') || msg.includes('getUserMedia') || msg.includes('NotFound')) {
+      store.setError('Microphone access denied. Allow mic access for OctoAlly in your OS settings, then try again.');
     } else {
       store.setError(msg);
     }
@@ -452,9 +482,11 @@ export async function startWakeWord() {
     store.setWakeWordPhase('passive');
 
     await invoke('stt_start', { mode: 'wake-word' });
+    if (store.rendererCapture) await startMicCapture();
     store.setModelLoaded(true);
     store.setError(null);
   } catch (e) {
+    stopMicCapture();
     store.setMicMode('off');
     store.setWakeWordPhase(null);
     store.setMicReady(false);
@@ -474,6 +506,7 @@ export async function stopMic() {
   if (!isDesktop) return;
 
   try {
+    stopMicCapture();
     await invoke('stt_stop');
     const store = useSpeechStore.getState();
     store.setMicMode('off');
@@ -572,6 +605,18 @@ export async function setWakePhrase(phrase: string) {
   }
 }
 
+/** Save the transcription language ('auto' | 'en' | 'vi'). */
+export async function setLanguage(lang: string) {
+  if (!isDesktop) return;
+
+  try {
+    await invoke('stt_set_language', { language: lang });
+    useSpeechStore.getState().setLanguage(lang);
+  } catch (e) {
+    console.error('[STT] Failed to set language:', e);
+  }
+}
+
 /**
  * Trigger Enter key in the active terminal.
  * Uses a store signal that Terminal components watch and send \r through their WebSocket.
@@ -593,6 +638,7 @@ async function startDictation() {
 
   try {
     // Stop current mode (wake word)
+    stopMicCapture();
     await invoke('stt_stop');
 
     // Clear stale transcription so Terminal effects don't replay old text
@@ -606,9 +652,11 @@ async function startDictation() {
 
     // Start global mic mode
     await invoke('stt_start', { mode: 'global' });
+    if (store.rendererCapture) await startMicCapture();
     store.setModelLoaded(true);
     store.setError(null);
   } catch (e) {
+    stopMicCapture();
     store.setDictationMode(false);
     store.setMicMode('off');
     const msg = e instanceof Error ? e.message : String(e);
@@ -630,6 +678,7 @@ async function stopDictation() {
   console.log('[STT] Stopping dictation mode, returnTo:', previousMode, 'commandMode:', returnToCommandMode);
 
   try {
+    stopMicCapture();
     await invoke('stt_stop');
     store.setDictationMode(false);
     store.setMicMode('off');

@@ -249,6 +249,7 @@ export function transcribe(
   whisperBin: string,
   modelPath: string,
   samples: Float32Array,
+  language = 'en',
 ): Promise<string> {
   return new Promise((resolve, reject) => {
     // Write temp WAV file
@@ -271,7 +272,7 @@ export function transcribe(
       '-m', modelPath,
       '-f', tmpFile,
       '-t', String(WHISPER_THREADS),
-      '-l', 'en',
+      '-l', language,
       '--no-timestamps',
       '-np', // no prints
     ];

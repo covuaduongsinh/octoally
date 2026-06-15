@@ -266,6 +266,12 @@ app.whenReady().then(async () => {
     if (serverWatchdog) clearInterval(serverWatchdog);
   });
 
+  // Grant microphone access to the main window (default session) so the
+  // renderer can capture audio via getUserMedia for speech-to-text. This is
+  // how STT works on Windows (no native arecord/sox capture path).
+  session.defaultSession.setPermissionRequestHandler((_wc, permission, cb) => cb(permission === 'media'));
+  session.defaultSession.setPermissionCheckHandler((_wc, permission) => permission === 'media');
+
   // Grant permissions for webview sessions (WebAuthn, notifications, etc.)
   const webpageSession = session.fromPartition('persist:webpages');
   webpageSession.setPermissionRequestHandler((_wc, _permission, callback) => {

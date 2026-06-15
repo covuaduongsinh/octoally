@@ -242,8 +242,48 @@ export function Terminal({ sessionId, visible = true, suspended = false, passive
     const pasteTarget = xtermTextarea || containerRef.current;
     const pasteHandler = (ev: Event) => {
       const ce = ev as ClipboardEvent;
-      const text = ce.clipboardData?.getData('text');
       const w = wsRef.current;
+
+      // Image paste: if the clipboard holds an image, save it to a temp file via
+      // the server and insert its path so Claude Code can read the image.
+      const items = ce.clipboardData?.items;
+      let imageFile: File | null = null;
+      if (items) {
+        for (let i = 0; i < items.length; i++) {
+          const it = items[i];
+          if (it.kind === 'file' && it.type.startsWith('image/')) {
+            imageFile = it.getAsFile();
+            break;
+          }
+        }
+      }
+      if (imageFile) {
+        ce.preventDefault();
+        ce.stopImmediatePropagation();
+        const reader = new FileReader();
+        reader.onload = () => {
+          fetch('/api/paste-image', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ dataUrl: reader.result }),
+          })
+            .then((r) => r.json())
+            .then((res) => {
+              if (res?.path && w && w.readyState === WebSocket.OPEN) {
+                // Use forward slashes so Claude's prompt doesn't treat \ as escapes.
+                // Pad with spaces so the path never glues to surrounding text.
+                const p = String(res.path).replace(/\\/g, '/');
+                w.send(JSON.stringify({ type: 'input', data: ' ' + p + ' ', paste: true }));
+              }
+            })
+            .catch(() => {});
+        };
+        reader.readAsDataURL(imageFile);
+        return;
+      }
+
+      // Text paste (default)
+      const text = ce.clipboardData?.getData('text');
       if (text && w && w.readyState === WebSocket.OPEN) {
         w.send(JSON.stringify({ type: 'input', data: text, paste: true }));
         ce.preventDefault();
@@ -680,20 +720,34 @@ export function Terminal({ sessionId, visible = true, suspended = false, passive
     return () => document.removeEventListener('visibilitychange', handleVisibilityChange);
   }, [visible, suspended]);
 
-  // Dictation mode: route transcriptions to this terminal when it's the visible/active one
+  // Track focus: record this terminal as the dictation target whenever it gains
+  // focus, so dictation routes to exactly one terminal (not every visible one in
+  // the grid/All view, which would broadcast the same text to all of them).
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+    const onFocusIn = () => useSpeechStore.getState().setFocusedTerminalId(sessionId);
+    el.addEventListener('focusin', onFocusIn);
+    return () => el.removeEventListener('focusin', onFocusIn);
+  }, [sessionId]);
+
+  // Dictation mode: route transcriptions to this terminal when it's the focused one
   const dictationMode = useSpeechStore((s) => s.dictationMode);
   const lastTranscription = useSpeechStore((s) => s.lastTranscription);
   const dictationLastSent = useRef('');
   useEffect(() => {
     if (!dictationMode || !visible || suspended) return;
     if (!lastTranscription || lastTranscription === dictationLastSent.current) return;
+    // Only the focused terminal accepts dictation — otherwise every visible
+    // terminal in the grid/All view would receive the same text.
+    if (useSpeechStore.getState().focusedTerminalId !== sessionId) return;
     dictationLastSent.current = lastTranscription;
     const w = wsRef.current;
     if (w && w.readyState === WebSocket.OPEN) {
       w.send(JSON.stringify({ type: 'input', data: lastTranscription }));
       termRef.current?.focus();
     }
-  }, [lastTranscription, dictationMode, visible, suspended]);
+  }, [lastTranscription, dictationMode, visible, suspended, sessionId]);
 
   // Voice command: press Enter in active terminal
   const pendingEnter = useSpeechStore((s) => s.pendingEnter);

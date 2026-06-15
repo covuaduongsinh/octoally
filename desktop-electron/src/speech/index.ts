@@ -33,6 +33,11 @@ type MicMode = 'off' | 'global' | 'push-to-talk' | 'wake-word';
 type SttBackend = 'local' | 'openai' | 'groq';
 type WakeWordPhase = 'passive' | 'active';
 
+// On Windows there is no native arecord/sox capture path (and whisper.cpp can't
+// build from source). Instead the renderer captures the mic via the Web Audio
+// API and streams 16kHz PCM to the main process via the `stt_push_audio` IPC.
+const RENDERER_CAPTURE = process.platform === 'win32';
+
 const MODEL_FILES: Record<string, string> = {
   tiny: 'ggml-tiny.bin',
   small: 'ggml-small.bin',
@@ -60,6 +65,7 @@ interface SttConfig {
   openaiApiKey: string;
   groqApiKey: string;
   modelSize: string;
+  language: string;
   wakePhrase: string;
   smartMatching: boolean;
   silenceTimeoutMs: number;
@@ -206,11 +212,15 @@ interface SpeechState {
   openaiApiKey: string;
   groqApiKey: string;
   modelSize: string;
+  language: string;
   smartMatching: boolean;
   silenceTimeoutMs: number;
   maxSpeechMs: number;
   whisperBin: string | null;
   audioCapture: AudioCapture | null;
+  // When the renderer captures audio (Windows), it streams PCM here instead of
+  // a spawned AudioCapture process. Set in stt_start, cleared in stopCapture.
+  feedSamples: ((samples: Float32Array) => void) | null;
   speaking: boolean;
   lastActivity: number; // Date.now()
   selectedDevice: string | undefined;
@@ -228,11 +238,13 @@ const state: SpeechState = {
   openaiApiKey: cfg.openaiApiKey || '',
   groqApiKey: cfg.groqApiKey || '',
   modelSize: cfg.modelSize || 'small',
+  language: cfg.language || 'en',
   smartMatching: cfg.smartMatching !== false, // default true
   silenceTimeoutMs: cfg.silenceTimeoutMs || 800,
   maxSpeechMs: cfg.maxSpeechMs || 30_000,
   whisperBin: null,
   audioCapture: null,
+  feedSamples: null,
   vad: null,
   speaking: false,
   lastActivity: Date.now(),
@@ -417,11 +429,34 @@ export function registerSpeechHandlers() {
     openaiApiKey: state.openaiApiKey,
     groqApiKey: state.groqApiKey,
     modelSize: state.modelSize,
+    language: state.language,
     wakePhrase: state.wakePhrase,
     smartMatching: state.smartMatching,
     silenceTimeoutMs: state.silenceTimeoutMs,
     maxSpeechMs: state.maxSpeechMs,
+    rendererCapture: RENDERER_CAPTURE,
   }));
+
+  ipcMain.handle('stt_set_language', (_e, args: { language: string }) => {
+    const lang = (args.language || '').trim();
+    const allowed = ['auto', 'en', 'vi'];
+    if (!allowed.includes(lang)) {
+      throw new Error(`Unknown language: ${lang}. Use ${allowed.join(', ')}.`);
+    }
+    state.language = lang;
+    saveConfig({ language: lang });
+    console.error(`[STT] Transcription language set to: ${lang}`);
+  });
+
+  // Renderer-captured audio (Windows). The renderer streams 16kHz mono Float32
+  // PCM frames here; feed them into the active VAD just like the native capture.
+  ipcMain.handle('stt_push_audio', (_e, args: { samples: number[] | Float32Array }) => {
+    if (!state.feedSamples) return;
+    const samples = args.samples instanceof Float32Array
+      ? args.samples
+      : Float32Array.from(args.samples);
+    state.feedSamples(samples);
+  });
 
   ipcMain.handle('stt_set_silence_timeout', (_e, args: { silenceTimeoutMs: number }) => {
     const ms = Math.max(200, Math.min(5000, args.silenceTimeoutMs));
@@ -514,19 +549,12 @@ export function registerSpeechHandlers() {
       const cloudProvider = (state.backend === 'groq' || state.backend === 'openai') ? state.backend as CloudProvider : null;
       const cloudApiKey = cloudProvider === 'groq' ? state.groqApiKey : cloudProvider === 'openai' ? state.openaiApiKey : '';
 
-      if (!state.audioCapture) {
+      if (!state.audioCapture && !state.feedSamples) {
         const vad = new VadProcessor(16000, state.silenceTimeoutMs, state.maxSpeechMs);
-        state.vad = vad;
-        const whisperBin = state.whisperBin;
+        const whisperBin = state.whisperBin!; // guaranteed by needsWhisper guard above
         const tinyModel = tinyPath;
-
-        state.audioCapture = new AudioCapture((samples) => {
-          const events = vad.process(samples);
-          for (const event of events) {
-            handleVadEventWakeWord(event, whisperBin, tinyModel, cloudProvider, cloudApiKey);
-          }
-        }, state.selectedDevice);
-        wireAudioCaptureExit();
+        startAudioSource(vad, (event) =>
+          handleVadEventWakeWord(event, whisperBin, tinyModel, cloudProvider, cloudApiKey));
       }
 
       state.wakeWordPhase = 'passive';
@@ -538,17 +566,9 @@ export function registerSpeechHandlers() {
         throw new Error(`${state.backend === 'groq' ? 'Groq' : 'OpenAI'} API key not set. Configure it in Speech settings.`);
       }
 
-      if (!state.audioCapture) {
+      if (!state.audioCapture && !state.feedSamples) {
         const vad = new VadProcessor(16000, state.silenceTimeoutMs, state.maxSpeechMs);
-        state.vad = vad;
-
-        state.audioCapture = new AudioCapture((samples) => {
-          const events = vad.process(samples);
-          for (const event of events) {
-            handleVadEventCloud(event, provider, apiKey);
-          }
-        }, state.selectedDevice);
-        wireAudioCaptureExit();
+        startAudioSource(vad, (event) => handleVadEventCloud(event, provider, apiKey));
       }
     } else {
       // Local backend: need whisper binary + model
@@ -557,19 +577,11 @@ export function registerSpeechHandlers() {
         throw new Error('Model not installed. Call stt_download_model first.');
       }
 
-      if (!state.audioCapture) {
+      if (!state.audioCapture && !state.feedSamples) {
         const vad = new VadProcessor(16000, state.silenceTimeoutMs, state.maxSpeechMs);
-        state.vad = vad;
-        const whisperBin = state.whisperBin;
+        const whisperBin = state.whisperBin!; // guaranteed by needsWhisper guard above
         const mPath = p;
-
-        state.audioCapture = new AudioCapture((samples) => {
-          const events = vad.process(samples);
-          for (const event of events) {
-            handleVadEvent(event, whisperBin, mPath);
-          }
-        }, state.selectedDevice);
-        wireAudioCaptureExit();
+        startAudioSource(vad, (event) => handleVadEvent(event, whisperBin, mPath));
       }
     }
 
@@ -628,6 +640,24 @@ export function registerSpeechHandlers() {
 // Internal
 // ---------------------------------------------------------------------------
 
+/**
+ * Set up the audio source for a VAD. On Windows the renderer streams PCM via
+ * `stt_push_audio` (so we just register `feedSamples`); elsewhere we spawn a
+ * native AudioCapture process. Both feed the same per-event handler.
+ */
+function startAudioSource(vad: VadProcessor, handle: (event: VadEvent) => void) {
+  state.vad = vad;
+  const feed = (samples: Float32Array) => {
+    for (const event of vad.process(samples)) handle(event);
+  };
+  if (RENDERER_CAPTURE) {
+    state.feedSamples = feed;
+  } else {
+    state.audioCapture = new AudioCapture(feed, state.selectedDevice);
+    wireAudioCaptureExit();
+  }
+}
+
 /** Wire up audio capture exit handler to reset speaking state if capture dies. */
 function wireAudioCaptureExit() {
   if (state.audioCapture) {
@@ -652,6 +682,12 @@ function stopCapture() {
   if (state.audioCapture) {
     state.audioCapture.stop();
     state.audioCapture = null;
+  }
+  if (state.feedSamples) {
+    state.feedSamples = null;
+    // Tell the renderer to stop the Web Audio mic (handles main-initiated stops
+    // like voice-command "stop listening" or the command-mode timeout).
+    emit('stt://stop-capture');
   }
   state.vad = null;
   if (state.activeTimeout) {
@@ -761,7 +797,7 @@ function handleVadEvent(event: VadEvent, whisperBin: string, modelPath: string) 
     case 'utterance':
       muteVad();
       emit('stt://transcribing');
-      transcribe(whisperBin, modelPath, event.samples)
+      transcribe(whisperBin, modelPath, event.samples, state.language)
         .then(async (text) => {
           if (!text) { muteVad(); return; }
           // In global mode, route through command matching (always-on command mode)
@@ -814,7 +850,7 @@ function handleVadEventCloud(event: VadEvent, provider: CloudProvider, apiKey: s
     case 'utterance':
       muteVad();
       emit('stt://transcribing');
-      transcribeCloud(provider, apiKey, event.samples)
+      transcribeCloud(provider, apiKey, event.samples, undefined, state.language)
         .then(async (text) => {
           if (!text) { muteVad(); return; }
           // In global mode, route through command matching (always-on command mode)

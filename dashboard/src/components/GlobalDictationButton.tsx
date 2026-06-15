@@ -134,26 +134,43 @@ export function GlobalDictationButton() {
       }
       return;
     }
-    // Pick a target: keep current focus if it's editable, otherwise auto-focus
-    // the most prominent editable on the page (or the visible terminal).
+    // Pick a target. Prefer the terminal the user last focused (tracked in the
+    // speech store) — clicking this button steals DOM focus, so we can't rely on
+    // document.activeElement still pointing at the terminal.
+    const store = useSpeechStore.getState();
     const current = document.activeElement;
-    let target: HTMLElement | null = isEditable(current)
-      ? (current as HTMLElement)
-      : null;
-    if (!target) target = findBestEditable();
-    if (target) {
+
+    if (isEditable(current) && !isInsideXterm(current)) {
+      // Case 1: a regular input/textarea is focused — dictate into it via DOM
+      // insertion (onTranscription handler below).
+      const target = current as HTMLElement;
       try {
         target.focus({ preventScroll: true } as FocusOptions);
       } catch {
         target.focus();
       }
       lastFocusedRef.current = target;
-    }
-    // If the target is an xterm helper, route via the existing dictationMode
-    // path — Terminal.tsx sends text over the PTY WebSocket when that flag is
-    // set. This matches the TerminalMicButton behavior.
-    if (target && isInsideXterm(target)) {
-      useSpeechStore.getState().setDictationMode(true);
+    } else if (store.focusedTerminalId) {
+      // Case 2: a terminal was the last focused element — route into that exact
+      // terminal via the dictationMode/PTY path (Terminal.tsx gates on the
+      // focused terminal id). Re-focus it so it keeps focus during dictation.
+      store.setDictationMode(true);
+      window.dispatchEvent(new CustomEvent('octoally:focus-terminal', {
+        detail: { sessionId: store.focusedTerminalId },
+      }));
+    } else {
+      // Case 3: nothing useful focused — auto-pick the most prominent editable
+      // on the page (regular input or, failing that, the visible terminal).
+      const target = findBestEditable();
+      if (target) {
+        try {
+          target.focus({ preventScroll: true } as FocusOptions);
+        } catch {
+          target.focus();
+        }
+        lastFocusedRef.current = target;
+        if (isInsideXterm(target)) store.setDictationMode(true);
+      }
     }
     setGlobalDictationActive(true);
     await toggleMic('push-to-talk');
