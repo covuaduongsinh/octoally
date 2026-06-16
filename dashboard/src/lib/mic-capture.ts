@@ -1,12 +1,13 @@
 /**
  * Renderer-side microphone capture via the Web Audio API.
  *
- * Used on Windows, where the main process has no native audio capture path
- * (no arecord/sox, and whisper.cpp can't build from source). Captures 16kHz
- * mono Float32 PCM and streams it to the main process via the `stt_push_audio`
- * IPC, which feeds the existing VAD + cloud transcription pipeline.
+ * Used wherever the renderer owns audio capture: the Windows desktop (the main
+ * process has no native arecord/sox path) and the web browser (no main process
+ * at all). Captures 16kHz mono Float32 PCM and streams it via `sttPushAudio`,
+ * which routes to the desktop IPC (`stt_push_audio`) or the /api/stt WebSocket
+ * binary stream — both feed the same VAD + cloud transcription pipeline.
  */
-import { invoke } from './tauri';
+import { sttPushAudio } from './stt-client';
 
 let stream: MediaStream | null = null;
 let ctx: AudioContext | null = null;
@@ -46,7 +47,7 @@ export async function startMicCapture(): Promise<void> {
   processor.onaudioprocess = (e) => {
     const input = e.inputBuffer.getChannelData(0); // Float32 @16kHz
     // Clone — the underlying buffer is reused by the audio thread.
-    void invoke('stt_push_audio', { samples: new Float32Array(input) }).catch(() => {});
+    sttPushAudio(new Float32Array(input));
   };
 
   // ScriptProcessorNode only fires while connected to a destination. Route it

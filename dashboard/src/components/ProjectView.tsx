@@ -11,6 +11,7 @@ import { WebPageView } from './WebPageView';
 import { api } from '../lib/api';
 import { CloseTabModal } from './CloseTabModal';
 import { useShortcut, markKeyboardNav } from '../lib/shortcuts';
+import { useSpeechStore } from '../lib/speech';
 
 interface ProjectViewProps {
   projectId: string;
@@ -826,6 +827,16 @@ export function ProjectView({ projectId, projectPath, projectName: _projectName,
   const showSubTabs = activeMode === 'terminal' || activeMode === 'explorer';
 
   const gridMode = showAllTerminals && !showLauncher && (terminalInstances.length + hiddenSessions.length) >= 2;
+
+  // Keep voice dictation pointed at the section the user sees as active: the
+  // focused grid pane (green border) in grid mode, else the active single
+  // terminal. This is more reliable than DOM focus, so switching sections mid-
+  // dictation routes text to the right terminal.
+  useEffect(() => {
+    if (!active) return;
+    const targetId = gridMode ? (gridFocusedId ?? activeTerminalId) : activeTerminalId;
+    if (targetId) useSpeechStore.getState().setFocusedTerminalId(targetId);
+  }, [active, gridMode, gridFocusedId, activeTerminalId]);
 
   // Persist grid preferences
   useEffect(() => {

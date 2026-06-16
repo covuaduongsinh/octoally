@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { Settings, Mic, RefreshCw, X, ChevronDown, Volume2 } from 'lucide-react';
-import { invoke } from '../lib/tauri';
+import { sttInvoke as invoke } from '../lib/stt-client';
 import { isAudioCuesEnabled, setAudioCuesEnabled } from '../lib/audio-cues';
 
 interface AudioDevice {

@@ -1,5 +1,6 @@
 import { create } from 'zustand';
-import { isDesktop, invoke, listen } from './tauri';
+import { isDesktop } from './tauri';
+import { sttAvailable, sttInvoke as invoke, sttListen as listen } from './stt-client';
 import { emitVoiceCommand } from './voice-commands';
 import type { VoiceCommandPayload } from './voice-commands';
 import { cueReady, cueSpeechEnd, cueTranscribed, cueWakeActivate } from './audio-cues';
@@ -61,6 +62,9 @@ interface SpeechStore {
   // True when the renderer captures the mic (Windows) instead of a native
   // process in the main app. Drives whether we run Web Audio capture.
   rendererCapture: boolean;
+  // True when local Whisper is available (desktop, or a server host with a
+  // whisper-cli binary). False in the browser — hides local/wake-word UI.
+  localWhisper: boolean;
   smartMatching: boolean;
   speaking: boolean;
   transcribing: boolean; // true while whisper is processing audio
@@ -131,12 +135,13 @@ interface SpeechStore {
   setGroqApiKey: (key: string) => void;
   setLanguage: (lang: string) => void;
   setRendererCapture: (v: boolean) => void;
+  setLocalWhisper: (v: boolean) => void;
   triggerEnter: () => void;
   setError: (e: string | null) => void;
 }
 
 export const useSpeechStore = create<SpeechStore>((set) => ({
-  available: isDesktop,
+  available: sttAvailable,
   micMode: 'off',
   micReady: false,
   modelInstalled: false,
@@ -147,6 +152,7 @@ export const useSpeechStore = create<SpeechStore>((set) => ({
   groqApiKey: '',
   language: 'en',
   rendererCapture: false,
+  localWhisper: isDesktop,
   smartMatching: true,
   speaking: false,
   transcribing: false,
@@ -196,6 +202,7 @@ export const useSpeechStore = create<SpeechStore>((set) => ({
   setGroqApiKey: (key) => set({ groqApiKey: key }),
   setLanguage: (lang) => set({ language: lang }),
   setRendererCapture: (v) => set({ rendererCapture: v }),
+  setLocalWhisper: (v) => set({ localWhisper: v }),
   triggerEnter: () => set((s) => ({ pendingEnter: s.pendingEnter + 1 })),
   setError: (e) => set({ error: e }),
 }));
@@ -224,12 +231,12 @@ export function offTranscription() {
 let listenersInitialized = false;
 
 export async function initSpeechListeners() {
-  if (!isDesktop || listenersInitialized) return;
+  if (!sttAvailable || listenersInitialized) return;
   listenersInitialized = true;
 
   // Load saved config (backend, API key, wake phrase)
   try {
-    const config = await invoke<{ backend: string; openaiApiKey: string; groqApiKey: string; modelSize: string; language?: string; wakePhrase?: string; smartMatching?: boolean; silenceTimeoutMs?: number; maxSpeechMs?: number; rendererCapture?: boolean }>('stt_get_config');
+    const config = await invoke<{ backend: string; openaiApiKey: string; groqApiKey: string; modelSize: string; language?: string; wakePhrase?: string; smartMatching?: boolean; silenceTimeoutMs?: number; maxSpeechMs?: number; rendererCapture?: boolean; localWhisper?: boolean }>('stt_get_config');
     const store = useSpeechStore.getState();
     store.setBackend(config.backend as 'local' | 'openai' | 'groq');
     store.setOpenaiApiKey(config.openaiApiKey || '');
@@ -240,6 +247,8 @@ export async function initSpeechListeners() {
     if (config.wakePhrase) store.setWakePhrase(config.wakePhrase);
     if (config.language) store.setLanguage(config.language);
     store.setRendererCapture(config.rendererCapture === true);
+    // Desktop always has local Whisper; web reports its server capability.
+    if (typeof config.localWhisper === 'boolean') store.setLocalWhisper(isDesktop || config.localWhisper);
   } catch (e) {
     console.warn('[STT] Failed to load config:', e);
   }
@@ -428,10 +437,16 @@ export async function initSpeechListeners() {
 
 /** Start the microphone in the given mode. Shows download modal if model not installed. */
 export async function startMic(mode: 'global' | 'push-to-talk') {
-  if (!isDesktop) return;
+  if (!sttAvailable) return;
 
   const store = useSpeechStore.getState();
   console.log('[STT] startMic called, mode:', mode, 'backend:', store.backend, 'modelInstalled:', store.modelInstalled);
+
+  // Local Whisper isn't available in the browser — steer the user to a cloud backend.
+  if (store.backend === 'local' && !store.localWhisper) {
+    store.setError("Local Whisper isn't available in the browser. Choose Groq or OpenAI in Speech settings.");
+    return;
+  }
 
   // For local backend, check if model is installed
   if (store.backend === 'local' && !store.modelInstalled) {
@@ -473,7 +488,7 @@ export async function startMic(mode: 'global' | 'push-to-talk') {
 
 /** Start wake word listening mode. */
 export async function startWakeWord() {
-  if (!isDesktop) return;
+  if (!sttAvailable) return;
 
   const store = useSpeechStore.getState();
   try {
@@ -503,7 +518,7 @@ export async function startWakeWord() {
 
 /** Stop the microphone. */
 export async function stopMic() {
-  if (!isDesktop) return;
+  if (!sttAvailable) return;
 
   try {
     stopMicCapture();
@@ -543,7 +558,7 @@ export async function toggleWakeWord() {
 
 /** Download a whisper model. */
 export async function downloadModel(modelSize: string) {
-  if (!isDesktop) return;
+  if (!sttAvailable) return;
 
   try {
     useSpeechStore.getState().setDownloadProgress(0);
@@ -558,7 +573,7 @@ export async function downloadModel(modelSize: string) {
 
 /** Force-unload the whisper model from memory. */
 export async function unloadModel() {
-  if (!isDesktop) return;
+  if (!sttAvailable) return;
 
   try {
     await invoke('stt_unload_model');
@@ -571,7 +586,7 @@ export async function unloadModel() {
 
 /** Set the VAD silence timeout (how long to wait after speech stops before sending). */
 export async function setSilenceTimeout(ms: number) {
-  if (!isDesktop) return;
+  if (!sttAvailable) return;
 
   try {
     await invoke('stt_set_silence_timeout', { silenceTimeoutMs: ms });
@@ -583,7 +598,7 @@ export async function setSilenceTimeout(ms: number) {
 
 /** Set the max speech duration (how long you can talk before the VAD force-segments). */
 export async function setMaxSpeechDuration(ms: number) {
-  if (!isDesktop) return;
+  if (!sttAvailable) return;
 
   try {
     await invoke('stt_set_max_speech', { maxSpeechMs: ms });
@@ -595,7 +610,7 @@ export async function setMaxSpeechDuration(ms: number) {
 
 /** Save the wake phrase. */
 export async function setWakePhrase(phrase: string) {
-  if (!isDesktop) return;
+  if (!sttAvailable) return;
 
   try {
     await invoke('stt_set_wake_phrase', { wakePhrase: phrase });
@@ -607,7 +622,7 @@ export async function setWakePhrase(phrase: string) {
 
 /** Save the transcription language ('auto' | 'en' | 'vi'). */
 export async function setLanguage(lang: string) {
-  if (!isDesktop) return;
+  if (!sttAvailable) return;
 
   try {
     await invoke('stt_set_language', { language: lang });
@@ -631,7 +646,7 @@ function simulateEnterKey() {
  * Transcriptions route to the currently focused terminal.
  */
 async function startDictation() {
-  if (!isDesktop) return;
+  if (!sttAvailable) return;
 
   const store = useSpeechStore.getState();
   console.log('[STT] Starting dictation mode');
@@ -670,7 +685,7 @@ async function startDictation() {
  * If commandModeActive, returns to wake-word active (command) mode instead of passive.
  */
 async function stopDictation() {
-  if (!isDesktop) return;
+  if (!sttAvailable) return;
 
   const store = useSpeechStore.getState();
   const returnToCommandMode = store.commandModeActive;

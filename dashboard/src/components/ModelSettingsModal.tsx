@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { Settings, Download, Check, Loader2, X, Cloud, HardDrive, Eye, EyeOff, Ear, Plus, Trash2, Sparkles, Timer, Clock, Languages } from 'lucide-react';
-import { invoke } from '../lib/tauri';
+import { sttInvoke as invoke } from '../lib/stt-client';
 import { useSpeechStore, downloadModel, stopMic, unloadModel, setWakePhrase, setSilenceTimeout, setMaxSpeechDuration, setLanguage } from '../lib/speech';
 
 const LANGUAGE_OPTIONS: { value: string; label: string }[] = [
@@ -47,6 +47,9 @@ export function ModelSettingsModal({ onClose }: ModelSettingsModalProps) {
   const [saving, setSaving] = useState(false);
   const downloadProgress = useSpeechStore((s) => s.downloadProgress);
   const modelLoaded = useSpeechStore((s) => s.modelLoaded);
+  // Local Whisper + wake-word need a server-side whisper-cli binary. In the
+  // browser (web) it's unavailable, so we hide those sections and only show cloud.
+  const localWhisper = useSpeechStore((s) => s.localWhisper);
   const whisperInstallStage = useSpeechStore((s) => s.whisperInstallStage);
   const whisperInstallPercent = useSpeechStore((s) => s.whisperInstallPercent);
   const whisperInstallMessage = useSpeechStore((s) => s.whisperInstallMessage);
@@ -94,14 +97,20 @@ export function ModelSettingsModal({ onClose }: ModelSettingsModalProps) {
     }
   };
 
+  // Local Whisper isn't selectable on web — fall back to the recommended cloud backend.
   useEffect(() => {
-    loadModels();
+    if (!localWhisper && draftBackend === 'local') setDraftBackend('groq');
+  }, [localWhisper, draftBackend]);
+
+  useEffect(() => {
+    if (localWhisper) loadModels();
+    else setLoading(false);
     const handleKey = (e: KeyboardEvent) => {
       if (e.key === 'Escape' && !downloadingModel) handleCancel();
     };
     window.addEventListener('keydown', handleKey);
     return () => window.removeEventListener('keydown', handleKey);
-  }, [onClose, downloadingModel]);
+  }, [onClose, downloadingModel, localWhisper]);
 
   // Refresh model list when download completes
   useEffect(() => {
@@ -297,6 +306,7 @@ export function ModelSettingsModal({ onClose }: ModelSettingsModalProps) {
         <div className="px-5 py-3 space-y-3" style={{ maxHeight: '60vh', overflowY: 'auto' }}>
           {/* Backend toggle */}
           <div className="flex rounded-lg overflow-hidden" style={{ border: '1px solid var(--border)' }}>
+            {localWhisper && (
             <button
               onClick={() => { setDraftBackend('local'); setError(null); }}
               className="flex-1 flex items-center justify-center gap-1.5 py-2 text-[11px] font-medium transition-colors"
@@ -308,6 +318,7 @@ export function ModelSettingsModal({ onClose }: ModelSettingsModalProps) {
               <HardDrive className="w-3.5 h-3.5" />
               Local
             </button>
+            )}
             <button
               onClick={() => { setDraftBackend('openai'); setError(null); }}
               className="flex-1 flex items-center justify-center gap-1.5 py-2 text-[11px] font-medium transition-colors"
@@ -743,7 +754,8 @@ export function ModelSettingsModal({ onClose }: ModelSettingsModalProps) {
             </div>
           )}
 
-          {/* Wake Word section */}
+          {/* Wake Word section — needs local tiny Whisper, so desktop/server-local only */}
+          {localWhisper && (
           <div
             className="p-3 rounded-lg space-y-2"
             style={{ background: 'var(--bg-secondary)', border: '1px solid var(--border)' }}
@@ -778,6 +790,7 @@ export function ModelSettingsModal({ onClose }: ModelSettingsModalProps) {
               Click the <Ear className="w-2.5 h-2.5 inline" /> button in the header to start wake word listening.
             </p>
           </div>
+          )}
 
           {error && (
             <p

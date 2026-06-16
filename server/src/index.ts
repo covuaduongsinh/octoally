@@ -21,6 +21,7 @@ import { streamRoutes } from './routes/stream.js';
 import { projectRoutes, initProjects } from './routes/projects.js';
 import { terminalRoutes } from './routes/terminal.js';
 import { fileRoutes } from './routes/files.js';
+import { sttRoutes } from './routes/stt.js';
 import { gitRoutes } from './routes/git.js';
 import { agentRoutes } from './routes/agent.js';
 import { settingsRoutes } from './routes/settings.js';
@@ -114,6 +115,7 @@ async function start() {
   await app.register(projectRoutes, { prefix: '/api' });
   await app.register(terminalRoutes, { prefix: '/api' });
   await app.register(fileRoutes, { prefix: '/api' });
+  await app.register(sttRoutes, { prefix: '/api' });
   await app.register(gitRoutes, { prefix: '/api' });
   await app.register(agentRoutes, { prefix: '/api' });
   await app.register(settingsRoutes, { prefix: '/api' });
