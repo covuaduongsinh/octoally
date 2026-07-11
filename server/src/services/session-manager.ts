@@ -239,34 +239,41 @@ function prunePtyOutput(): void {
   try {
     const db = getDb();
     // Delete rows for completed/cancelled/failed sessions entirely
-    const dead = db.prepare(`
+    db.prepare(`
       DELETE FROM pty_output WHERE session_id IN (
         SELECT id FROM sessions WHERE status IN ('completed', 'cancelled', 'failed')
       )
     `).run();
-    // For active sessions, keep only the last MAX_PTY_ROWS_PER_SESSION rows
-    const trimmed = db.prepare(`
+    // For active sessions, keep only the last MAX_PTY_ROWS_PER_SESSION rows.
+    //
+    // The per-session cutoff is computed ONCE, in a grouped subquery.
+    //
+    // Do NOT rewrite this as a correlated `SELECT MAX(p2.seq) ... WHERE
+    // p2.session_id = p.session_id`: SQLite re-runs that aggregate for every
+    // candidate row, and it only stays fast because idx_pty_output_session_seq
+    // happens to cover it. Without that exact index each re-run rescans the
+    // session's rows and loads their `data` blobs — measured at 3.3 SECONDS on a
+    // ~14k-row table. better-sqlite3 is synchronous, so that blocks the event loop
+    // and every terminal keystroke freezes behind it. Computing the cutoff once is
+    // fast with or without the index, which is why it's written this way.
+    db.prepare(`
       DELETE FROM pty_output WHERE rowid IN (
         SELECT p.rowid FROM pty_output p
         JOIN sessions s ON p.session_id = s.id
+        JOIN (
+          SELECT session_id, MAX(seq) AS max_seq FROM pty_output GROUP BY session_id
+        ) m ON m.session_id = p.session_id
         WHERE s.status IN ('running', 'detached')
-        AND p.seq <= (
-          SELECT MAX(p2.seq) - ? FROM pty_output p2 WHERE p2.session_id = p.session_id
-        )
+        AND p.seq <= m.max_seq - ?
       )
     `).run(MAX_PTY_ROWS_PER_SESSION);
 
-    // Periodic VACUUM when we deleted a lot of data
-    const totalDeleted = dead.changes + trimmed.changes;
-    if (totalDeleted > 500) {
-      const freePages = (db.pragma('freelist_count') as { freelist_count: number }[])[0].freelist_count;
-      const pageSize = (db.pragma('page_size') as { page_size: number }[])[0].page_size;
-      const freeMB = freePages * pageSize / 1048576;
-      if (freeMB > 10) {
-        db.exec('VACUUM');
-        console.log(`  VACUUM reclaimed ~${freeMB.toFixed(1)}MB after pruning ${totalDeleted} rows`);
-      }
-    }
+    // NOTE: no VACUUM here. It rewrites the whole database file and, like every
+    // other better-sqlite3 call, does it synchronously on the event loop — stalling
+    // every terminal for the duration (~180ms on a 63MB DB, and it grows with the
+    // file). All it bought was returning free pages to the OS, and SQLite reuses
+    // those pages for subsequent inserts on its own — pty_output is continuously
+    // refilled, so nothing grows without bound.
   } catch (err) {
     console.error('Failed to prune pty_output:', err);
   }
